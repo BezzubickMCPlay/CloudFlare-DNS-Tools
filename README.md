@@ -1,10 +1,18 @@
-
-
 # CloudFlare DNS Tools
 
 Этот userscript для Tampermonkey/Greasemonkey представляет собой мощный инструмент для управления DNS-политиками в **Cloudflare Gateway**. Он был создан для решения основной проблемы: невозможности удобно управлять большими списками блокировки (100,000+ доменов) через стандартный интерфейс Cloudflare.
 
 Скрипт добавляет удобную панель управления прямо на страницу Cloudflare Gateway, позволяя вам синхронизировать огромные списки доменов в формате `hosts` всего одной кнопкой.
+
+### История и благодарности
+
+Этот скрипт является глубокой переработкой и развитием идей, заложенных в оригинальном скрипте от автора **AntiKeks**. Огромная благодарность ему за первоначальную работу, которая послужила основой для этого проекта.
+
+## Установка
+
+**[>> Установить скрипт <<](https://raw.githubusercontent.com/BezzubickMCPlay/CloudFlare-DNS-Tools/main/CloudFlare-DNS-Tools.user.js)**
+
+*(Для установки требуется менеджер пользовательских скриптов, например, [Tampermonkey](https://www.tampermonkey.net/))*
 
 ## Ключевые возможности
 
@@ -31,14 +39,6 @@
 6.  **Создание:** Только когда на всех старых полках не остается места, он ставит новую полку (`[DNS Tools] AdBlock 111`) и начинает заполнять ее.
 
 Для каждой "полки" (списка) он также вешает табличку-инструкцию (`DNS-правило`), которая гласит: "Все, что на этой полке, — блокировать".
-
-## Установка
-
-1.  Установите менеджер пользовательских скриптов, например, **Tampermonkey** (для Chrome, Firefox, Edge, Safari).
-2.  Откройте файл скрипта `CloudFlare DNS Tools.user.js` и скопируйте весь его код.
-3.  В панели Tampermonkey нажмите на иконку "Добавить новый скрипт" (`+`).
-4.  Вставьте скопированный код в редактор, заменяя все содержимое.
-5.  Нажмите "Файл" -> "Сохранить".
 
 ## Как использовать
 
@@ -87,6 +87,16 @@ This userscript for Tampermonkey/Greasemonkey is a powerful tool for managing DN
 
 The script adds a user-friendly control panel directly onto the Cloudflare Gateway page, allowing you to synchronize massive `hosts`-formatted domain lists with a single click.
 
+### History & Acknowledgements
+
+This script is a deep refactoring and evolution of the ideas laid out in the original script by the author **AntiKeks**. Huge thanks to him for the initial work that served as the foundation for this project.
+
+## Installation
+
+**[>> Install Script <<](https://raw.githubusercontent.com/BezzubickMCPlay/CloudFlare-DNS-Tools/main/CloudFlare-DNS-Tools.user.js)**
+
+*(Requires a userscript manager like [Tampermonkey](https://www.tampermonkey.net/))*
+
 ## Key Features
 
 *   **Handles Huge Lists:** Easily processes lists with hundreds of thousands of domains without freezing your browser.
@@ -112,14 +122,6 @@ The script acts like a smart librarian:
 6.  **Creation:** Only when all existing shelves are full does it add a new shelf (`[DNS Tools] AdBlock 111`) and start filling it.
 
 For each "shelf" (list), it also hangs an instruction sign (`DNS Rule`) that says, "Block everything on this shelf."
-
-## Installation
-
-1.  Install a userscript manager, such as **Tampermonkey** (for Chrome, Firefox, Edge, Safari).
-2.  Open the script file `CloudFlare DNS Tools.user.js` and copy its entire content.
-3.  In the Tampermonkey dashboard, click the "Add a new script" (`+`) icon.
-4.  Paste the copied code into the editor, replacing all existing content.
-5.  Click "File" -> "Save".
 
 ## How to Use
 
