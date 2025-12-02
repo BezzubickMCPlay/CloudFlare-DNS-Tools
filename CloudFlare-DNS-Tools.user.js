@@ -1,14 +1,17 @@
 // ==UserScript==
-// @name         CloudFlare DNS Tools (v4.2 - The Optimizer)
+// @name         CloudFlare DNS Tools
 // @namespace    http://tampermonkey.net/
-// @version      4.2
+// @version      4.5
 // @description  Расширение, позволяющее добавлять в Gateway DNS CloudFlare записи из hosts (0.0.0.0 группируется как блокирующие правила) 
+// @description  Исправлена работа с новой панелью one.dash.cloudflare.com (удалена зависимость от /gateway/ в URL).
 // @author       BezzubickMCPlay (Fork AntiKeks)
 // @license      AGPLv3
+// @match        https://one.dash.cloudflare.com/*/traffic-policies/*
 // @match        https://one.dash.cloudflare.com/*/gateway/*
 // @grant        GM_addStyle
 // @run-at       document-end
 // ==/UserScript==
+
 
 (function () {
     'use strict';
@@ -18,6 +21,7 @@
     const LIST_ITEM_LIMIT = 1000;
     const AUTO_REFRESH_DELAY = 5;
     const LIST_NAME_PREFIX = '[DNS Tools] AdBlock';
+    const API_THROTTLE_MS = 150; // Пауза между API вызовами для стабильности
 
     const Utils = {
         debugLog: (m, d = null) => console.log(`[CF-DNS-DEBUG ${new Date().toLocaleTimeString()}]`, m, d || ''),
@@ -46,12 +50,18 @@
                 return true;
             });
         },
+        // Функция для извлечения Account ID из нового URL
+        getAccountIdFromUrl: () => {
+            // Ищем 32-значный hex код в пути URL (например, /6b66.../)
+            const match = window.location.pathname.match(/\/([a-f0-9]{32})(?:\/|$)/i);
+            return match ? match[1] : null;
+        },
         sendApiRequest: async (url, options) => {
             try {
                 const r = await fetch(url, options);
                 const text = await r.text();
                 if (r.ok) return { success: true, data: text ? JSON.parse(text) : {} };
-                Utils.debugError(`Ошибка API (${r.status})`, { body: options.body, response: text });
+                Utils.debugError(`Ошибка API (${r.status})`, { url, options, response: text });
                 return { success: false, error: Utils.parseApiError(r.status, text) };
             } catch (e) {
                 Utils.debugError('Сетевая ошибка', e);
@@ -66,9 +76,9 @@
         constructor(accountId, ui) {
             this.accountId = accountId;
             this.ui = ui;
+            // API остается на dash.cloudflare.com, даже если UI на one.dash
             this.apiBase = `https://dash.cloudflare.com/api/v4/accounts/${this.accountId}/gateway`;
             this.authOptions = { headers: { 'Content-Type': 'application/json' }, credentials: 'include' };
-            this.state = {};
             this.stats = { listsCreated: 0, rulesCreated: 0, domainsAdded: 0, domainsRemoved: 0, duplicatesRemoved: 0, listsRemoved: 0, rulesRemoved: 0, overridesCreated: 0, overridesUpdated: 0, overridesSkipped: 0 };
         }
 
@@ -79,6 +89,7 @@
             try {
                 await this.syncAdBlock(sourceDomains);
                 await this.syncOverrides(overrideLines);
+                this.logFinalReport();
                 this.progress({ stage: 'ЗАВЕРШЕНО', message: 'Все операции успешно выполнены.', current: 1, total: 1 });
                 return { success: true, stats: this.stats };
             } catch (e) {
@@ -96,7 +107,6 @@
             }
             this.log(`Найдено ${sourceDomains.size} AdBlock доменов.`);
 
-            // Этап 1: Анализ
             this.progress({ stage: 'ADBLOCK: АНАЛИЗ', message: 'Получение списков и правил...', current: 1, total: 3 });
             const [listsResp, rulesResp] = await Promise.all([
                 Utils.sendApiRequest(`${this.apiBase}/lists`, this.authOptions),
@@ -110,7 +120,7 @@
             this.log(`Найдено ${managedLists.length} управляемых списков.`);
 
             this.progress({ stage: 'ADBLOCK: АНАЛИЗ', message: 'Чтение содержимого списков...', current: 2, total: 3 });
-            const domainToLists = new Map(); // <domain, listId[]>
+            const domainToLists = new Map();
             for (const list of managedLists) {
                 const items = await this._getListItems(list.id);
                 items.forEach(item => {
@@ -120,7 +130,6 @@
             }
             this.log(`Найдено ${domainToLists.size} уникальных доменов в ${managedLists.length} списках.`);
 
-            // +++ ЭТАП 2: ДЕДУПЛИКАЦИЯ +++
             this.progress({ stage: 'ADBLOCK: ДЕДУПЛИКАЦИЯ', message: 'Поиск и удаление дубликатов...', current: 0, total: 1 });
             const removalsByList = new Map();
             domainToLists.forEach((listIds, domain) => {
@@ -128,7 +137,7 @@
                     for (let i = 1; i < listIds.length; i++) {
                         const listIdToRemoveFrom = listIds[i];
                         if (!removalsByList.has(listIdToRemoveFrom)) removalsByList.set(listIdToRemoveFrom, []);
-                        removalsByList.get(listIdToRemoveFrom).push({ value: domain });
+                        removalsByList.get(listIdToRemoveFrom).push(domain);
                         this.stats.duplicatesRemoved++;
                     }
                 }
@@ -138,7 +147,8 @@
                 this.log(`Найдено ${this.stats.duplicatesRemoved} дубликатов. Начинаем чистку...`);
                 for (const [listId, items] of removalsByList.entries()) {
                     this.log(`Удаление ${items.length} дубликатов из списка ${listId}...`);
-                    const res = await Utils.sendApiRequest(`${this.apiBase}/lists/${listId}/items`, { method: 'DELETE', body: JSON.stringify({ items }), ...this.authOptions });
+                    await Utils.sleep(API_THROTTLE_MS);
+                    const res = await Utils.sendApiRequest(`${this.apiBase}/lists/${listId}`, { method: 'PATCH', body: JSON.stringify({ remove: items }), ...this.authOptions });
                     if (!res.success) this.log(`Ошибка при удалении дубликатов: ${res.error}`);
                 }
             } else {
@@ -146,26 +156,28 @@
             }
             this.progress({ stage: 'ADBLOCK: ДЕДУПЛИКАЦИЯ', message: 'Дедупликация завершена.', current: 1, total: 1 });
 
-            // Этап 3: Сравнение
             const existingDomains = new Map();
-            domainToLists.forEach((listIds, domain) => existingDomains.set(domain, listIds[0])); // Теперь у каждого домена только один список
+            domainToLists.forEach((listIds, domain) => {
+                const primaryListId = listIds.find(id => !removalsByList.has(id)) || listIds[0];
+                if (primaryListId) existingDomains.set(domain, primaryListId);
+            });
             const domainsToAdd = [...sourceDomains].filter(d => !existingDomains.has(d));
             const domainsToRemove = [...existingDomains.keys()].filter(d => !sourceDomains.has(d));
             this.log(`К добавлению: ${domainsToAdd.length}, к удалению: ${domainsToRemove.length}.`);
 
-            // Этап 4: Очистка
             this.progress({ stage: 'ADBLOCK: ОЧИСТКА', message: 'Удаление лишних доменов...', current: 0, total: domainsToRemove.length });
             if (domainsToRemove.length > 0) {
                 const removals = new Map();
                 domainsToRemove.forEach(d => {
                     const listId = existingDomains.get(d);
                     if (!removals.has(listId)) removals.set(listId, []);
-                    removals.get(listId).push({ value: d });
+                    removals.get(listId).push(d);
                 });
                 let processed = 0;
                 for (const [listId, items] of removals.entries()) {
                     this.log(`Удаление ${items.length} доменов из списка ${listId}...`);
-                    const res = await Utils.sendApiRequest(`${this.apiBase}/lists/${listId}/items`, { method: 'DELETE', body: JSON.stringify({ items }), ...this.authOptions });
+                    await Utils.sleep(API_THROTTLE_MS);
+                    const res = await Utils.sendApiRequest(`${this.apiBase}/lists/${listId}`, { method: 'PATCH', body: JSON.stringify({ remove: items }), ...this.authOptions });
                     if (res.success) this.stats.domainsRemoved += items.length; else this.log(`Ошибка при удалении: ${res.error}`);
                     processed += items.length;
                     this.progress({ stage: 'ADBLOCK: ОЧИСТКА', message: `Удаление доменов...`, current: processed, total: domainsToRemove.length });
@@ -176,23 +188,23 @@
             let currentLists = (await Utils.sendApiRequest(`${this.apiBase}/lists`, this.authOptions)).data.result || [];
             for (const list of currentLists.filter(l => l.name.startsWith(LIST_NAME_PREFIX) && l.count === 0)) {
                 this.log(`Список ${list.name} пуст. Удаляем...`);
+                await Utils.sleep(API_THROTTLE_MS);
                 const res = await Utils.sendApiRequest(`${this.apiBase}/lists/${list.id}`, { method: 'DELETE', ...this.authOptions });
                 if (res.success) this.stats.listsRemoved++; else this.log(`Ошибка удаления списка: ${res.error}`);
                 const rule = allRules.find(r => r.name === list.name || r.traffic.includes(`$${list.id}`));
                 if (rule) {
+                    await Utils.sleep(API_THROTTLE_MS);
                     const ruleRes = await Utils.sendApiRequest(`${this.apiBase}/rules/${rule.id}`, { method: 'DELETE', credentials: 'include' });
                     if (ruleRes.success) this.stats.rulesRemoved++; else this.log(`Ошибка удаления правила: ${ruleRes.error}`);
                 }
             }
 
-            // Этап 5: Создание
             this.progress({ stage: 'ADBLOCK: СОЗДАНИЕ', message: 'Добавление новых доменов...', current: 0, total: domainsToAdd.length });
             if (domainsToAdd.length > 0) {
                 let remaining = [...domainsToAdd];
                 currentLists = (await Utils.sendApiRequest(`${this.apiBase}/lists`, this.authOptions)).data.result.filter(l => l.name.startsWith(LIST_NAME_PREFIX)) || [];
                 let processed = 0;
 
-                // +++ СНАЧАЛА ЗАПОЛНЯЕМ СУЩЕСТВУЮЩИЕ +++
                 this.log('Поиск свободного места в существующих списках...');
                 for (const list of currentLists) {
                     if (remaining.length === 0) break;
@@ -200,6 +212,7 @@
                     if (space > 0) {
                         const chunk = remaining.splice(0, space);
                         this.log(`Заполнение существующего списка ${list.name} (${chunk.length} доменов)...`);
+                        await Utils.sleep(API_THROTTLE_MS);
                         const patchRes = await Utils.sendApiRequest(`${this.apiBase}/lists/${list.id}`, { method: 'PATCH', body: JSON.stringify({ append: chunk.map(value => ({ value })) }), ...this.authOptions });
                         if (patchRes.success) this.stats.domainsAdded += chunk.length; else this.log(`Ошибка заполнения списка: ${patchRes.error}`);
                         processed += chunk.length;
@@ -207,13 +220,13 @@
                     }
                 }
 
-                // +++ ПОТОМ СОЗДАЕМ НОВЫЕ +++
                 while (remaining.length > 0) {
                     const listNumbers = currentLists.map(l => parseInt(l.name.split(' ').pop()) || 0);
                     const nextNum = (listNumbers.length > 0 ? Math.max(...listNumbers) : 0) + 1;
                     const newListName = `${LIST_NAME_PREFIX} ${nextNum}`;
 
                     this.log(`Создание нового списка ${newListName}...`);
+                    await Utils.sleep(API_THROTTLE_MS);
                     const createListRes = await Utils.sendApiRequest(`${this.apiBase}/lists`, { method: 'POST', body: JSON.stringify({ name: newListName, type: 'DOMAIN' }), ...this.authOptions });
                     if (!createListRes.success) { this.log(`Ошибка создания списка: ${createListRes.error}`); break; }
 
@@ -223,10 +236,12 @@
 
                     const chunk = remaining.splice(0, LIST_ITEM_LIMIT);
                     this.log(`Добавление ${chunk.length} доменов в ${newListName}...`);
+                    await Utils.sleep(API_THROTTLE_MS);
                     const patchRes = await Utils.sendApiRequest(`${this.apiBase}/lists/${newList.id}`, { method: 'PATCH', body: JSON.stringify({ append: chunk.map(value => ({ value })) }), ...this.authOptions });
                     if (patchRes.success) this.stats.domainsAdded += chunk.length; else this.log(`Ошибка добавления доменов: ${patchRes.error}`);
 
                     const prec = 999999 - nextNum;
+                    await Utils.sleep(API_THROTTLE_MS);
                     const createRuleRes = await Utils.sendApiRequest(`${this.apiBase}/rules`, { method: 'POST', body: JSON.stringify({ name: newListName, precedence: prec, action: 'block', traffic: `any(dns.domains[*] in $${newList.id})`, filters: ['dns'], enabled: true }), credentials: 'include' });
                     if (createRuleRes.success) this.stats.rulesCreated++; else this.log(`Ошибка создания правила: ${createRuleRes.error}`);
 
@@ -264,6 +279,7 @@
                 const existing = domainMap.get(domain);
                 const rulePayload = { name: `${domain} → ${ip}`, enabled: true, action: "override", filters: ["dns"], traffic: `any(dns.domains[*] == "${domain}")`, rule_settings: { override_ips: [ip] } };
 
+                await Utils.sleep(API_THROTTLE_MS);
                 if (existing) {
                     if (existing.ip === ip) {
                         this.stats.overridesSkipped++;
@@ -274,7 +290,7 @@
                     }
                 } else {
                     this.log(`Создание правила для ${domain}...`);
-                    const res = await Utils.sendApiRequest(`${this.apiBase}/rules`, { method: 'POST', body: JSON.stringify({ ...rulePayload, precedence: getNextPrec(10000) }), ...this.authOptions });
+                    const res = await Utils.sendApiRequest(`${this.apiBase}/rules`, { method: 'POST', body: JSON.stringify({ ...rulePayload, precedence: getNextPrec(this.ui.precedenceInput.value) }), ...this.authOptions });
                     if (res.success) this.stats.overridesCreated++; else this.log(`Ошибка создания ${domain}: ${res.error}`);
                 }
                 processed++;
@@ -290,6 +306,17 @@
             res.data.result?.forEach(item => items.add(item.value));
             return items;
         }
+
+        logFinalReport() {
+            this.log("--- ИТОГОВЫЙ ОТЧЕТ ---");
+            this.log(`Очистка дубликатов: ${this.stats.duplicatesRemoved}`);
+            this.log(`Удалено доменов: ${this.stats.domainsRemoved}`);
+            this.log(`Добавлено доменов: ${this.stats.domainsAdded}`);
+            this.log(`Создано списков/правил: ${this.stats.listsCreated}`);
+            this.log(`Удалено списков/правил: ${this.stats.listsRemoved}`);
+            this.log(`Override создано/обновлено/пропущено: ${this.stats.overridesCreated}/${this.stats.overridesUpdated}/${this.stats.overridesSkipped}`);
+            this.log("----------------------");
+        }
     }
 
     // --- UI и Инициализация ---
@@ -303,11 +330,10 @@
                 .cf-panel-header { padding: 16px 24px !important; font-weight: 600 !important; display: flex !important; justify-content: space-between !important; align-items: center !important; cursor: pointer !important; user-select: none !important; color: var(--m3-primary) !important; font-size: 18px !important; }
                 .cf-panel-header #toggle-btn { transition: transform 0.3s ease; }
                 #cf-panel-content { padding: 16px 24px !important; display: block !important; border-top: 1px solid var(--m3-outline); }
-                .cf-grid { display: grid !important; grid-template-columns: 1fr 1fr; gap: 12px !important; margin-bottom: 20px !important; }
+                .cf-grid { display: grid !important; grid-template-columns: 1fr; gap: 12px !important; margin-bottom: 20px !important; }
                 .cf-grid button { border-radius: 20px !important; font-weight: 500 !important; padding: 10px 24px !important; transition: background-color 0.3s ease, opacity 0.3s ease; display: flex; align-items: center; justify-content: center; gap: 8px; border:none; cursor:pointer; }
                 button.sync { background: var(--m3-primary) !important; color: var(--m3-on-primary) !important; }
-                button.add { background: var(--m3-primary-container) !important; color: var(--m3-on-primary-container) !important; opacity: 0.6; cursor: not-allowed; }
-                button.delete { background: var(--m3-error-container) !important; color: var(--m3-on-error-container) !important; grid-column: 1 / -1; }
+                button.delete { background: var(--m3-error-container) !important; color: var(--m3-on-error-container) !important; }
                 .settings-box { background: var(--m3-surface-container) !important; padding: 16px !important; border-radius: 16px !important; margin-bottom: 20px; }
                 #hosts-input { background: var(--m3-surface-container) !important; color: var(--m3-on-surface-variant) !important; border: 1px solid var(--m3-outline) !important; border-radius: 16px !important; width: 100%; box-sizing: border-box; padding: 12px; height: 140px; }
                 #hosts-input:focus { border-color: var(--m3-primary) !important; outline: 2px solid var(--m3-primary) !important; outline-offset: 2px; }
@@ -325,10 +351,10 @@
             <div id="cf-panel-content">
                 <div class="cf-grid">
                     <button class="sync" id="sync-btn"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg> Синхронизировать</button>
-                    <button class="add" id="add-btn"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg> Добавить</button>
                     <button class="delete" id="delete-btn"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg> Удалить все</button>
                 </div>
                 <div class="settings-box">
+                    <div style="display: flex; align-items: center; gap: 8px;"><label for="precedence-input">Precedence для Override:</label><input type="number" value="10000" min="1" id="precedence-input" style="width: 80px; padding: 4px 8px;"></div>
                     <div style="display: flex; align-items: center; gap: 8px;"><input type="checkbox" id="log-checkbox"><label for="log-checkbox">Debug режим (не перезагружать)</label></div>
                 </div>
                 <textarea id="hosts-input" placeholder="Вставьте hosts записи сюда..."></textarea>
@@ -356,10 +382,10 @@
             content: panel.querySelector('#cf-panel-content'),
             toggleBtn: panel.querySelector('#toggle-btn'),
             syncBtn: panel.querySelector('#sync-btn'),
-            addBtn: panel.querySelector('#add-btn'),
             deleteBtn: panel.querySelector('#delete-btn'),
             logCheckbox: panel.querySelector('#log-checkbox'),
             hostsInput: panel.querySelector('#hosts-input'),
+            precedenceInput: panel.querySelector('#precedence-input'),
             progress: {
                 stage: panel.querySelector('#progress-stage'),
                 bar: panel.querySelector('#progress-bar-inner'),
@@ -403,7 +429,6 @@
         });
 
         ui.copyLogBtn.addEventListener('click', () => navigator.clipboard.writeText(ui.logs.join('\n')));
-        ui.addBtn.addEventListener('click', () => alert('Режим "Добавить" отключен. Используйте "Синхронизировать" для надежной работы.'));
 
         ui.deleteBtn.addEventListener('click', async () => {
             if (ui.isRunning) return;
@@ -412,10 +437,11 @@
             ui.setRunning(true);
             ui.reset();
             ui.log('Начинаем полное удаление...');
-            const match = window.location.pathname.match(/\/([a-z0-9]{32})\/gateway\//i);
-            if (!match) { ui.log('❌ Ошибка: не найден account_id.'); ui.setRunning(false); return; }
 
-            const accountId = match[1];
+            // --- ИСПРАВЛЕНИЕ: Универсальный поиск ID ---
+            const accountId = Utils.getAccountIdFromUrl();
+            if (!accountId) { ui.log('❌ Ошибка: не найден account_id в URL.'); ui.setRunning(false); return; }
+
             const apiBase = `https://dash.cloudflare.com/api/v4/accounts/${accountId}/gateway`;
             const authOptions = { credentials: 'include' };
 
@@ -428,6 +454,7 @@
             for (const item of [...rulesToDelete, ...listsToDelete]) {
                 const type = item.traffic ? 'rules' : 'lists';
                 ui.log(`Удаление ${type === 'rules' ? 'правила' : 'списка'}: ${item.name}`);
+                await Utils.sleep(API_THROTTLE_MS);
                 await Utils.sendApiRequest(`${apiBase}/${type}/${item.id}`, { method: 'DELETE', ...authOptions });
             }
 
@@ -439,13 +466,14 @@
             if (ui.isRunning) return;
             const lines = Utils.deduplicateByDomain(Utils.cleanInputLines(ui.hostsInput.value));
             if (lines.length === 0) { alert("Нет валидных строк для импорта!"); return; }
-            const match = window.location.pathname.match(/\/([a-z0-9]{32})\/gateway\//i);
-            if (!match) { alert("Ошибка: не найден account_id в URL."); return; }
+
+            // --- ИСПРАВЛЕНИЕ: Универсальный поиск ID ---
+            const accountId = Utils.getAccountIdFromUrl();
+            if (!accountId) { alert("Ошибка: не найден account_id в URL."); return; }
 
             ui.setRunning(true);
             ui.reset();
 
-            const accountId = match[1];
             const blockDomains = new Set(lines.filter(l => l.startsWith('0.0.0.0 ')).map(l => l.split(/\s+/)[1].trim()));
             const overrideLines = lines.filter(l => !l.startsWith('0.0.0.0 '));
 
@@ -459,7 +487,7 @@
             ui.setRunning(false);
         });
 
-        Utils.debugLog('✅ CloudFlare DNS Tools v4.2 успешно загружены!');
+        Utils.debugLog('✅ CloudFlare DNS Tools v4.5 успешно загружены!');
     }
 
     main().catch(e => Utils.debugError('❌ Критическая ошибка инициализации:', e));
